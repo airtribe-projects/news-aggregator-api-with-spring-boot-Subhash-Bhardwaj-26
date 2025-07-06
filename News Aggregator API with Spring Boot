@@ -1,0 +1,259 @@
+package com.news;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.http.*;
+import org.springframework.stereotype.*;
+import org.springframework.context.annotation.*;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.authentication.*;
+import org.springframework.security.core.userdetails.*;
+import org.springframework.security.core.*;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.authentication.builders.AuthenticationManagerBuilder;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
+import org.springframework.security.core.userdetails.User;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.beans.factory.annotation.*;
+import org.springframework.web.reactive.function.client.WebClient;
+
+import jakarta.annotation.PostConstruct;
+import jakarta.persistence.*;
+import jakarta.validation.constraints.*;
+import jakarta.validation.Valid;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+import io.jsonwebtoken.*;
+
+@SpringBootApplication
+public class NewsAggregatorApplication {
+    public static void main(String[] args) {
+        SpringApplication.run(NewsAggregatorApplication.class, args);
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+}
+
+// === Entities ===
+
+@Entity
+class AppUser {
+    @Id @GeneratedValue private Long id;
+    @NotBlank private String username;
+    @NotBlank private String password;
+    private String preferences;
+
+    public AppUser() {}
+    public AppUser(String username, String password) {
+        this.username = username; this.password = password;
+    }
+
+    // getters & setters
+    public Long getId() { return id; }
+    public String getUsername() { return username; }
+    public String getPassword() { return password; }
+    public String getPreferences() { return preferences; }
+    public void setUsername(String username) { this.username = username; }
+    public void setPassword(String password) { this.password = password; }
+    public void setPreferences(String preferences) { this.preferences = preferences; }
+}
+
+interface AppUserRepository extends org.springframework.data.jpa.repository.JpaRepository<AppUser, Long> {
+    Optional<AppUser> findByUsername(String username);
+}
+
+// === DTOs ===
+
+class AuthRequest {
+    @NotBlank public String username;
+    @NotBlank public String password;
+}
+
+class AuthResponse {
+    public String token;
+    public AuthResponse(String token) { this.token = token; }
+}
+
+class PreferencesRequest {
+    @NotBlank public String preferences;
+}
+
+// === JWT Utility ===
+
+@Component
+class JwtUtil {
+    private final String SECRET = "mysecretkey";
+    public String generateToken(String username) {
+        return Jwts.builder()
+            .setSubject(username)
+            .setIssuedAt(new Date(System.currentTimeMillis()))
+            .setExpiration(new Date(System.currentTimeMillis() + 86400000))
+            .signWith(SignatureAlgorithm.HS256, SECRET)
+            .compact();
+    }
+
+    public String extractUsername(String token) {
+        return Jwts.parser().setSigningKey(SECRET)
+            .parseClaimsJws(token).getBody().getSubject();
+    }
+
+    public boolean validateToken(String token) {
+        try {
+            Jwts.parser().setSigningKey(SECRET).parseClaimsJws(token);
+            return true;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+}
+
+// === Auth Filter ===
+
+class JwtAuthFilter extends UsernamePasswordAuthenticationFilter {
+    private final JwtUtil jwtUtil;
+    private final AppUserDetailsService userService;
+
+    public JwtAuthFilter(JwtUtil jwtUtil, AppUserDetailsService userService) {
+        this.jwtUtil = jwtUtil;
+        this.userService = userService;
+    }
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response,
+                                    FilterChain chain) throws java.io.IOException, jakarta.servlet.ServletException {
+        String authHeader = request.getHeader("Authorization");
+        if (authHeader != null && authHeader.startsWith("Bearer ")) {
+            String token = authHeader.substring(7);
+            if (jwtUtil.validateToken(token)) {
+                String username = jwtUtil.extractUsername(token);
+                UserDetails userDetails = userService.loadUserByUsername(username);
+                UsernamePasswordAuthenticationToken authToken =
+                        new UsernamePasswordAuthenticationToken(userDetails, null, userDetails.getAuthorities());
+                SecurityContextHolder.getContext().setAuthentication(authToken);
+            }
+        }
+        chain.doFilter(request, response);
+    }
+}
+
+// === UserDetails Service ===
+
+@Service
+class AppUserDetailsService implements UserDetailsService {
+    @Autowired AppUserRepository repo;
+
+    @Override
+    public UserDetails loadUserByUsername(String username) {
+        AppUser user = repo.findByUsername(username).orElseThrow();
+        return new User(user.getUsername(), user.getPassword(), List.of(new SimpleGrantedAuthority("USER")));
+    }
+}
+
+// === Web Security ===
+
+@Configuration
+@EnableWebSecurity
+class SecurityConfig {
+    @Autowired private AppUserDetailsService userDetailsService;
+    @Autowired private JwtUtil jwtUtil;
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        JwtAuthFilter jwtFilter = new JwtAuthFilter(jwtUtil, userDetailsService);
+        http.csrf().disable().authorizeHttpRequests()
+            .requestMatchers("/api/register", "/api/login").permitAll()
+            .anyRequest().authenticated()
+            .and()
+            .sessionManagement().sessionCreationPolicy(SessionCreationPolicy.STATELESS);
+        http.addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class);
+        return http.build();
+    }
+
+    @Bean
+    public AuthenticationManager authManager(HttpSecurity http) throws Exception {
+        return http.getSharedObject(AuthenticationManagerBuilder.class)
+            .userDetailsService(userDetailsService)
+            .passwordEncoder(new BCryptPasswordEncoder()).and().build();
+    }
+}
+
+// === Controllers ===
+
+@RestController
+@RequestMapping("/api")
+class AuthController {
+    @Autowired private AppUserRepository repo;
+    @Autowired private PasswordEncoder encoder;
+    @Autowired private AuthenticationManager authManager;
+    @Autowired private JwtUtil jwtUtil;
+
+    @PostMapping("/register")
+    public ResponseEntity<?> register(@RequestBody @Valid AuthRequest req) {
+        if (repo.findByUsername(req.username).isPresent())
+            return ResponseEntity.badRequest().body("User exists");
+        AppUser user = new AppUser(req.username, encoder.encode(req.password));
+        repo.save(user);
+        return ResponseEntity.ok("Registered");
+    }
+
+    @PostMapping("/login")
+    public ResponseEntity<?> login(@RequestBody @Valid AuthRequest req) {
+        Authentication auth = authManager.authenticate(
+            new UsernamePasswordAuthenticationToken(req.username, req.password));
+        String token = jwtUtil.generateToken(req.username);
+        return ResponseEntity.ok(new AuthResponse(token));
+    }
+}
+
+@RestController
+@RequestMapping("/api")
+class PreferencesController {
+    @Autowired private AppUserRepository repo;
+
+    @GetMapping("/preferences")
+    public String getPreferences(Authentication auth) {
+        return repo.findByUsername(auth.getName()).orElseThrow().getPreferences();
+    }
+
+    @PutMapping("/preferences")
+    public String setPreferences(@RequestBody @Valid PreferencesRequest req, Authentication auth) {
+        AppUser user = repo.findByUsername(auth.getName()).orElseThrow();
+        user.setPreferences(req.preferences);
+        repo.save(user);
+        return "Preferences updated";
+    }
+
+}
+
+@RestController
+@RequestMapping("/api")
+class NewsController {
+    @Autowired private AppUserRepository repo;
+    private final WebClient webClient = WebClient.create("https://gnews.io/api/v4/search");
+
+    private final String API_KEY = "YOUR_GNEWS_API_KEY"; // Replace with real API key
+
+    @GetMapping("/news")
+    public ResponseEntity<?> getNews(Authentication auth) {
+        String query = repo.findByUsername(auth.getName()).orElseThrow().getPreferences();
+        if (query == null || query.isEmpty()) query = "world";
+
+        String uri = "?q=" + query + "&token=" + API_KEY + "&lang=en&max=5";
+        return webClient.get()
+                .uri(uri)
+                .retrieve()
+                .toEntity(String.class)
+                .block();
+    }
+}
